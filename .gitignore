@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+screenshots/
+*.png
+.running
+*.log.DS_Store
+*.xlsx
+!templates/*.xlsx
+!.env
+reports/*.xlsx
+reports/
+51la.xlsx
+51la_current.xlsx
+reports/

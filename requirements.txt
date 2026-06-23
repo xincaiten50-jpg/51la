@@ -1,0 +1,6 @@
+playwright
+openpyxl
+python-dotenv
+Pillow
+pywin32; platform_system == "Windows"
+requests
