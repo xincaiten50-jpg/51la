@@ -528,6 +528,7 @@ async def run_once(cfg: Config, args: argparse.Namespace) -> list:
             excel_path=str(ctx.workbook_path),
             excel_screenshot_path=excel_screenshot_path,
             data_date=report.data_date if report else None,
+            attach_excel_file=cfg.attach_excel_file,
         )
 
     # Step 6: Copy to current (after successful Excel write, in precreated/auto_create mode)
