@@ -62,6 +62,7 @@ class Config:
     copy_to_current: bool = True
 
     allow_real_email_send: bool = False  # hard safety gate — default OFF
+    attach_excel_file: bool = True  # whether to attach Excel file in email
 
     # Internal state
     _errors: List[str] = field(default_factory=list)
@@ -117,6 +118,7 @@ def load() -> Config:
         current_workbook_path=_env("CURRENT_WORKBOOK_PATH", "51la_current.xlsx").strip(),
         copy_to_current=_env("COPY_TO_CURRENT", "true").strip().lower() in {"1", "true", "yes", "on"},
         allow_real_email_send=_env("ALLOW_REAL_EMAIL_SEND", "false").strip().lower() in {"1", "true", "yes", "on"},
+        attach_excel_file=_env("ATTACH_EXCEL_FILE", "true").strip().lower() in {"1", "true", "yes", "on"},
         _email_deprecation_warned=email_deprecation_warned,
     )
 

@@ -164,10 +164,11 @@ def send_email(
     excel_path: str,
     excel_screenshot_path: Optional[str],
     data_date: Optional[datetime] = None,  # date this data belongs to
+    attach_excel_file: bool = True,  # whether to attach Excel file
 ) -> NotificationResult:
     """
     Send an email report in the specified language (vi or zh).
-    Attaches website screenshots inline and Excel file as attachment.
+    Attaches website screenshots inline and optionally Excel file as attachment.
     Returns NotificationResult with per-channel status.
     """
     print("\n" + "=" * 50)
@@ -306,7 +307,7 @@ def send_email(
             print(f"[ERROR] Failed to attach Excel screenshot: {str(e)[:80]}")
 
     # Attach Excel file
-    if os.path.exists(excel_path):
+    if attach_excel_file and os.path.exists(excel_path):
         try:
             with open(excel_path, "rb") as f:
                 excel_data = f.read()
@@ -318,6 +319,8 @@ def send_email(
         attachment.add_header("Content-Disposition", "attachment", filename="51la.xlsx")
         msg.attach(attachment)
         print("[INFO] Attached Excel file: 51la.xlsx")
+    elif not attach_excel_file:
+        print("[INFO] Excel attachment disabled — not attaching")
     else:
         print(f"[WARN] Excel file not found: {excel_path}")
 
@@ -392,6 +395,7 @@ def notify_all(
     excel_path: str,
     excel_screenshot_path: Optional[str],
     data_date: Optional[datetime] = None,  # date this data belongs to (for email subject/body)
+    attach_excel_file: bool = True,  # whether to attach Excel in email
 ) -> List[NotificationResult]:
     """
     Send notifications via configured channels.
@@ -402,7 +406,7 @@ def notify_all(
     delay = getattr(cfg, "wecom_send_delay_seconds", 1.0)
 
     if method in {"gmail", "both"}:
-        result = send_email(cfg, lang, screenshot_paths, uv_values, pv_values, excel_path, excel_screenshot_path, data_date=data_date)
+        result = send_email(cfg, lang, screenshot_paths, uv_values, pv_values, excel_path, excel_screenshot_path, data_date=data_date, attach_excel_file=attach_excel_file)
         results.append(result)
 
     if method in {"wecom", "both"}:
