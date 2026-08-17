@@ -383,6 +383,58 @@ def send_email(
     return NotificationResult(channel="gmail", success=False, message="", error="SMTP send failed after retries")
 
 
+# ==================== FAILURE ALERT ====================
+
+def send_failure_alert(cfg: Config, date_str: str, attempts: int, last_error: Optional[str]) -> bool:
+    """
+    Send a plain-text alert to the sender address when the scheduled run keeps
+    failing after all retries — so the operator notices the same day instead of
+    discovering missing report emails days later.
+    Best-effort: never raises; returns True if the alert was sent.
+    """
+    try:
+        smtp_password = normalize_smtp_password(cfg.smtp_password)
+        if not cfg.smtp_sender or not smtp_password:
+            print("[WARN] Failure alert skipped: SMTP sender/password not configured")
+            return False
+
+        subject = f"[ALERT] 51.la scraper FAILED {attempts}x on {date_str}"
+        body = (
+            "The scheduled 51.la report could NOT be completed today.\n\n"
+            f"Date: {date_str}\n"
+            f"Attempts made: {attempts}\n"
+            f"Last error: {last_error or 'unknown'}\n\n"
+            "Check the machine, then restart if needed:\n"
+            "  pm2 logs 51la-daily --lines 100\n"
+            "  pm2 restart 51la-daily\n\n"
+            "(This alert is sent by the scraper itself.)"
+        )
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = cfg.smtp_sender
+        msg["To"] = cfg.smtp_sender
+
+        context = ssl.create_default_context()
+        if cfg.smtp_use_ssl:
+            server = smtplib.SMTP_SSL(cfg.smtp_server, cfg.smtp_port, context=context)
+        else:
+            server = smtplib.SMTP(cfg.smtp_server, cfg.smtp_port)
+        with server:
+            if cfg.smtp_use_tls:
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
+            if cfg.smtp_auth_required:
+                server.login(cfg.smtp_sender, smtp_password)
+            server.sendmail(cfg.smtp_sender, [cfg.smtp_sender], msg.as_string())
+
+        print(f"[OK] Failure alert sent to {cfg.smtp_sender}")
+        return True
+    except Exception as e:
+        print(f"[WARN] Failure alert could not be sent: {e}")
+        return False
+
+
 # ==================== NOTIFY ALL ====================
 
 def notify_all(
