@@ -43,6 +43,46 @@ PAGE_TIMEOUT = 60000
 ELEMENT_TIMEOUT = 15000
 SCREENSHOT_DIR = "screenshots"
 
+# ==================== BROWSER SELF-HEAL ====================
+
+async def ensure_browser_available() -> Tuple[bool, str]:
+    """
+    Verify the Playwright Chromium browser exists; auto-reinstall if missing.
+
+    Protects against cache cleaners wiping ~/Library/Caches/ms-playwright —
+    without the browser every run dies with BrowserType.launch error.
+    Returns (ok, message).
+    """
+    import subprocess
+    import sys
+
+    try:
+        async with async_playwright() as p:
+            exe_path = p.chromium.executable_path
+    except Exception as e:
+        return False, f"Could not query chromium path: {e}"
+
+    if os.path.isfile(exe_path):
+        return True, f"Chromium present ({exe_path})"
+
+    print(f"[WARN] Playwright browser missing: {exe_path}")
+    print("[INFO] Auto-reinstalling Chromium (this may take 1-2 minutes)...")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=600,
+        )
+    except Exception as e:
+        return False, f"Browser reinstall failed to run: {e}"
+
+    if result.returncode == 0 and os.path.isfile(exe_path):
+        print("[OK] Chromium reinstalled successfully")
+        return True, "Chromium reinstalled after cache wipe"
+
+    tail = (result.stderr or result.stdout or "")[-300:]
+    return False, f"Browser reinstall failed (rc={result.returncode}): {tail}"
+
+
 # ==================== DATA CLASSES ====================
 
 # Page-level status after scraping

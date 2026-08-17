@@ -4,6 +4,7 @@ __pycache__/
 screenshots/
 *.png
 .running
+.run_state
 *.log.DS_Store
 *.xlsx
 !templates/*.xlsx

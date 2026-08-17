@@ -14,6 +14,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import json
 import os
 import sys
 import time as time_module
@@ -32,7 +33,12 @@ import workbook_manager
 
 
 LOCK_FILE = ".running"
+RUN_STATE_FILE = ".run_state"
 SCREENSHOT_DIR = "screenshots"
+
+# Scheduled-run resilience: catch-up + retry + alert
+MAX_RUN_ATTEMPTS = 5          # attempts per day before giving up and alerting
+RETRY_DELAY_SECONDS = 15 * 60  # wait between failed attempts
 
 
 # ==================== RUN CONTEXT ====================
@@ -170,8 +176,10 @@ def is_process_alive(pid: int) -> bool:
             import os
             os.kill(pid, 0)
             return True
-    except (ProcessLookupError, PermissionError):
-        return True  # Process doesn't exist or we don't have permission
+    except ProcessLookupError:
+        return False  # No such process — lock is stale, safe to remove
+    except PermissionError:
+        return True  # Process exists but owned by another user
     except Exception:
         return False
 
@@ -241,6 +249,29 @@ def release_lock(lock_path: str = LOCK_FILE):
             print(f"[INFO] Lock released.")
     except Exception:
         pass
+
+
+# ==================== RUN STATE (scheduler) ====================
+
+def _read_run_state() -> dict:
+    """Read persisted scheduler state: last_success date + per-day attempt counters.
+
+    Survives process restarts so a machine reboot / PM2 restart can never
+    duplicate a successful run or forget that today's run is still missing.
+    """
+    try:
+        with open(RUN_STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_run_state(state: dict) -> None:
+    try:
+        with open(RUN_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"[WARN] Could not write {RUN_STATE_FILE}: {e}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -419,6 +450,13 @@ async def run_once(cfg: Config, args: argparse.Namespace) -> list:
         from dataclasses import replace
         report = None
     else:
+        # Browser self-heal: verify Playwright Chromium before scraping,
+        # reinstall automatically if a cache cleaner removed it
+        browser_ok, browser_msg = await scraper.ensure_browser_available()
+        if not browser_ok:
+            raise RuntimeError(f"Playwright browser unavailable: {browser_msg}")
+        print(f"[OK] Browser check: {browser_msg}")
+
         print("\n[Step 1] Scraping UV/PV from 4 pages...")
         report = await scraper.scrape_all_uv(data_date=ctx.report_date)
 
@@ -446,6 +484,13 @@ async def run_once(cfg: Config, args: argparse.Namespace) -> list:
         if scrape_errors:
             print(f"\n⚠ PARTIAL FAILURE: {len(scrape_errors)} page(s) had SCRAPE_ERROR.")
             print("  Affected pages:", [f"#{i+1} ({cfg.machine_names[i]})" for i in scrape_errors])
+            if len(scrape_errors) == len(report.uv_results):
+                # All pages failed — raise so the scheduler retries instead of
+                # emailing an all-zero report (SCRAPE_ERROR never overwrites Excel)
+                raise RuntimeError(
+                    f"All {len(report.uv_results)} pages returned SCRAPE_ERROR — "
+                    "aborting before Excel write / notification"
+                )
     else:
         print("\n[SKIP] No scrape report available (--skip-scrape mode)")
 
@@ -570,11 +615,21 @@ def print_summary(results: list, elapsed: float, dry_run: bool = False, no_notif
 
 
 def run_scheduled(cfg: Config, args: argparse.Namespace):
-    """Daily scheduler loop at SCHEDULE_HOUR:SCHEDULE_MINUTE Vietnam time.
+    """Daily scheduler at SCHEDULE_HOUR:SCHEDULE_MINUTE with catch-up + retry + alert.
 
     Each scheduled run calls run_once(cfg, args), which builds a fresh RunContext
     so that report_date and workbook path are recomputed for every iteration —
     NOT captured at scheduler startup.
+
+    Resilience (see .run_state file):
+    - CATCH-UP: fires when now >= schedule time and today's run has not succeeded
+      yet — so a machine restart / sleep / PM2 restart that misses the exact
+      scheduled minute still runs the report the same day.
+    - RETRY: a failed run (exception, all-pages SCRAPE_ERROR, or all notification
+      channels failing) is retried up to MAX_RUN_ATTEMPTS times, spaced
+      RETRY_DELAY_SECONDS apart.
+    - ALERT: when attempts are exhausted, sends an email to the sender address
+      so the operator finds out the same day.
 
     .env is reloaded on every iteration so config changes take effect without restart.
     """
@@ -585,13 +640,26 @@ def run_scheduled(cfg: Config, args: argparse.Namespace):
     print("=" * 60)
     print("51.LA SCRAPER — SCHEDULED MODE")
     print("=" * 60)
-    print(f"Schedule: {cfg.schedule_hour:02d}:{cfg.schedule_minute:02d} ({cfg.timezone})")
+    print(f"Schedule: {cfg.schedule_hour:02d}:{cfg.schedule_minute:02d} ({cfg.timezone}) — catch-up enabled")
+    print(f"Retry: up to {MAX_RUN_ATTEMPTS} attempts/day, {RETRY_DELAY_SECONDS // 60} min apart, then alert email")
     print(f"Method: {args.method or cfg.notification_method}")
     print(f"Lang: {args.lang or cfg.email_lang}")
     print("[INFO] Press Ctrl+C to stop")
     print("=" * 60)
 
-    last_run_date = None  # Track to avoid duplicate sends on same date
+    # First deployment: seed state with today so the scheduler does not fire a
+    # catch-up run for a slot that may have been handled before this change.
+    state = _read_run_state()
+    if "last_success" not in state:
+        try:
+            tz = ZoneInfo(cfg.timezone)
+            today_str = datetime.now(tz).strftime("%Y-%m-%d")
+        except Exception:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+        _write_run_state({"last_success": today_str, "attempts": 0, "attempt_date": today_str})
+        print(f"[INFO] Initialized {RUN_STATE_FILE} with today ({today_str}) — no catch-up on first start.")
+
+    next_attempt_at = 0.0  # epoch seconds; 0 = no retry backoff pending
 
     while True:
         try:
@@ -599,47 +667,75 @@ def run_scheduled(cfg: Config, args: argparse.Namespace):
             load_dotenv(dotenv_path=dotenv_path, override=True)
             cfg = load()
 
-            # Get current time in configured timezone
             tz = ZoneInfo(cfg.timezone)
             now_tz = datetime.now(tz)
-            current_hour = now_tz.hour
-            current_minute = now_tz.minute
+            today_str = now_tz.strftime("%Y-%m-%d")
 
-            if current_hour == cfg.schedule_hour and current_minute == cfg.schedule_minute:
-                run_date_str = now_tz.strftime("%Y-%m-%d")
+            state = _read_run_state()
+            # Reset attempt counter on a new day
+            if state.get("attempt_date") != today_str:
+                state = {"last_success": state.get("last_success"), "attempts": 0, "attempt_date": today_str}
+                _write_run_state(state)
+            attempts = int(state.get("attempts") or 0)
+            ran_today = state.get("last_success") == today_str
 
-                # Avoid duplicate send on same date
-                if run_date_str == last_run_date:
-                    print(f"\n[{now_tz.strftime('%H:%M')}] Already ran today ({run_date_str}), skipping.")
-                    time_module.sleep(60)
-                    continue
+            target = now_tz.replace(hour=cfg.schedule_hour, minute=cfg.schedule_minute, second=0, microsecond=0)
+            tomorrow_target = target + timedelta(days=1)
 
-                print(f"\n[{now_tz.strftime('%Y-%m-%d %H:%M:%S')}] Starting scheduled run...")
+            if (not ran_today) and now_tz >= target \
+                    and attempts < MAX_RUN_ATTEMPTS \
+                    and time_module.time() >= next_attempt_at:
+                is_catchup = now_tz > target + timedelta(minutes=2)
+                label = "CATCH-UP" if is_catchup else "scheduled"
+                print(f"\n[{now_tz.strftime('%Y-%m-%d %H:%M:%S')}] Starting {label} run (attempt {attempts + 1}/{MAX_RUN_ATTEMPTS})...")
                 start = time_module.time()
-
+                failure_reason = None
                 try:
                     results = asyncio.run(run_once(cfg, args))
                     elapsed = time_module.time() - start
                     dry_run = getattr(args, "dry_run", False)
                     no_notification = getattr(args, "no_notification", False)
                     print_summary(results, elapsed, dry_run=dry_run, no_notification=no_notification)
-                    last_run_date = run_date_str
+                    # Treat "all notification channels failed" as a failed run
+                    if results and not any(r.success for r in results):
+                        failure_reason = "; ".join((r.error or r.message) for r in results)[:300]
+                        print(f"\n[ERROR] All notification channels failed: {failure_reason}")
                 except Exception as e:
-                    print(f"\n[ERROR] Run failed: {e}")
+                    failure_reason = str(e)[:300]
+                    print(f"\n[ERROR] Run failed: {failure_reason}")
 
-                print(f"\n[{now_tz.strftime('%Y-%m-%d %H:%M:%S')}] Next run tomorrow at {cfg.schedule_hour:02d}:{cfg.schedule_minute:02d}...")
-                time_module.sleep(60)  # Avoid re-trigger in same minute
+                if failure_reason is None:
+                    _write_run_state({"last_success": today_str, "attempts": 0, "attempt_date": today_str})
+                    print(f"[{datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')}] Run succeeded — next run tomorrow at {cfg.schedule_hour:02d}:{cfg.schedule_minute:02d}.")
+                else:
+                    attempts += 1
+                    _write_run_state({"last_success": state.get("last_success"), "attempts": attempts, "attempt_date": today_str})
+                    if attempts >= MAX_RUN_ATTEMPTS:
+                        print(f"[ERROR] Gave up after {attempts} attempts — sending failure alert email.")
+                        notifier.send_failure_alert(cfg, today_str, attempts, failure_reason)
+                    else:
+                        next_attempt_at = time_module.time() + RETRY_DELAY_SECONDS
+                        print(f"[INFO] Retry #{attempts + 1}/{MAX_RUN_ATTEMPTS} in {RETRY_DELAY_SECONDS // 60} minutes.")
+                time_module.sleep(5)
+                continue
 
+            # Waiting — display what we're waiting for
+            if now_tz < target:
+                next_event, note = target, "next run"
+            elif ran_today:
+                next_event, note = tomorrow_target, "next run"
+            elif attempts >= MAX_RUN_ATTEMPTS:
+                next_event, note = tomorrow_target, "next run (gave up today)"
             else:
-                # Show countdown to next run
-                target = now_tz.replace(hour=cfg.schedule_hour, minute=cfg.schedule_minute, second=0, microsecond=0)
-                if now_tz >= target:
-                    target += timedelta(days=1)
-                wait_secs = (target - now_tz).total_seconds()
-                wait_h = int(wait_secs // 3600)
-                wait_m = int((wait_secs % 3600) // 60)
-                print(f"\r[{now_tz.strftime('%H:%M')}] Next run in {wait_h}h {wait_m}m...", end="", flush=True)
-                time_module.sleep(30)
+                next_event, note = tomorrow_target, "retry"
+                if next_attempt_at > time_module.time():
+                    next_event = datetime.fromtimestamp(next_attempt_at, tz)
+
+            wait_secs = max(0.0, (next_event - now_tz).total_seconds())
+            wait_h = int(wait_secs // 3600)
+            wait_m = int((wait_secs % 3600) // 60)
+            print(f"\r[{now_tz.strftime('%H:%M')}] Waiting for {note}: {wait_h}h {wait_m}m...", end="", flush=True)
+            time_module.sleep(30)
 
         except KeyboardInterrupt:
             print("\n\n[INFO] Scheduler stopped by user.")
