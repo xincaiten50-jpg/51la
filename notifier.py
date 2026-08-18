@@ -23,6 +23,11 @@ import requests
 
 from config import Config, get_email_recipients, normalize_smtp_password
 
+# Socket timeout for every SMTP connection (connect / banner / TLS / login / send).
+# Without this, a stalled connection blocks forever — which also freezes the
+# scheduler loop (no retry, no failure alert).
+SMTP_TIMEOUT = 60
+
 
 # ==================== RESULT TYPES ====================
 
@@ -336,14 +341,14 @@ def send_email(
             print(f"\n[INFO] Connecting to SMTP ({cfg.smtp_provider}: {cfg.smtp_server}:{cfg.smtp_port}), attempt {attempt}...")
             if cfg.smtp_use_ssl:
                 # Port 465 with implicit SSL
-                with smtplib.SMTP_SSL(cfg.smtp_server, cfg.smtp_port, context=context) as server:
+                with smtplib.SMTP_SSL(cfg.smtp_server, cfg.smtp_port, context=context, timeout=SMTP_TIMEOUT) as server:
                     server.set_debuglevel(1 if cfg.smtp_debug else 0)
                     if cfg.smtp_auth_required:
                         server.login(cfg.smtp_sender, smtp_password)
                     server.sendmail(cfg.smtp_sender, smtp_recipients, msg.as_string())
             elif cfg.smtp_use_tls:
                 # Port 587 with STARTTLS
-                with smtplib.SMTP(cfg.smtp_server, cfg.smtp_port) as server:
+                with smtplib.SMTP(cfg.smtp_server, cfg.smtp_port, timeout=SMTP_TIMEOUT) as server:
                     server.set_debuglevel(1 if cfg.smtp_debug else 0)
                     server.ehlo()
                     server.starttls(context=context)
@@ -353,7 +358,7 @@ def send_email(
                     server.sendmail(cfg.smtp_sender, smtp_recipients, msg.as_string())
             else:
                 # Plain text (rare — only for local testing)
-                with smtplib.SMTP(cfg.smtp_server, cfg.smtp_port) as server:
+                with smtplib.SMTP(cfg.smtp_server, cfg.smtp_port, timeout=SMTP_TIMEOUT) as server:
                     server.set_debuglevel(1 if cfg.smtp_debug else 0)
                     if cfg.smtp_auth_required:
                         server.login(cfg.smtp_sender, smtp_password)
@@ -416,9 +421,9 @@ def send_failure_alert(cfg: Config, date_str: str, attempts: int, last_error: Op
 
         context = ssl.create_default_context()
         if cfg.smtp_use_ssl:
-            server = smtplib.SMTP_SSL(cfg.smtp_server, cfg.smtp_port, context=context)
+            server = smtplib.SMTP_SSL(cfg.smtp_server, cfg.smtp_port, context=context, timeout=SMTP_TIMEOUT)
         else:
-            server = smtplib.SMTP(cfg.smtp_server, cfg.smtp_port)
+            server = smtplib.SMTP(cfg.smtp_server, cfg.smtp_port, timeout=SMTP_TIMEOUT)
         with server:
             if cfg.smtp_use_tls:
                 server.ehlo()

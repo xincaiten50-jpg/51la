@@ -182,6 +182,22 @@ def _extract_numeric(text: str) -> Optional[int]:
     return None
 
 
+def _clear_stale_screenshot(index: int, screenshot_path: str) -> str:
+    """
+    On SCRAPE_ERROR the page has no fresh screenshot — delete any file left by a
+    previous run so it can never be attached to an email as if it were current.
+    Returns "" (no screenshot for this page).
+    """
+    n = index + 1
+    try:
+        if screenshot_path and os.path.exists(screenshot_path):
+            os.remove(screenshot_path)
+            print(f"[{n}] Removed stale screenshot from a previous run: {screenshot_path}")
+    except OSError as e:
+        print(f"[{n}] Could not remove stale screenshot: {e}")
+    return ""
+
+
 async def _save_debug_artifacts(page: Page, index: int, error_msg: str):
     """
     Save sanitized debug artifacts when scraping fails.
@@ -287,7 +303,7 @@ async def scrape_uv_from_link(
             err = "No UV selector matched; page may not have loaded"
             print(f"[{n}/{total}] SCRAPE_ERROR: {err}")
             await _save_debug_artifacts(page, index, err)
-            return ScrapeResult(index=index, uv=0, pv=0, screenshot_path=screenshot_path, status="SCRAPE_ERROR", error=err)
+            return ScrapeResult(index=index, uv=0, pv=0, screenshot_path=_clear_stale_screenshot(index, screenshot_path), status="SCRAPE_ERROR", error=err)
 
         # uv_text_found has the text; check if we got a number
         uv = _extract_numeric(uv_text_found)
@@ -296,7 +312,7 @@ async def scrape_uv_from_link(
             err = f"No numeric UV found; selector returned label text: {uv_text_found!r}"
             print(f"[{n}/{total}] SCRAPE_ERROR: {err}")
             await _save_debug_artifacts(page, index, err)
-            return ScrapeResult(index=index, uv=0, pv=0, screenshot_path=screenshot_path, status="SCRAPE_ERROR", error=err)
+            return ScrapeResult(index=index, uv=0, pv=0, screenshot_path=_clear_stale_screenshot(index, screenshot_path), status="SCRAPE_ERROR", error=err)
 
         # We got a numeric value — uv >= 0 is valid data from 51.la
         # uv > 0 = PASS, uv == 0 = NO_DATA
@@ -348,12 +364,12 @@ async def scrape_uv_from_link(
         err = "Timeout waiting for page"
         print(f"[{n}/{total}] SCRAPE_ERROR: {err}")
         await _save_debug_artifacts(page, index, err)
-        return ScrapeResult(index=index, uv=0, pv=0, screenshot_path=screenshot_path, status="SCRAPE_ERROR", error=err)
+        return ScrapeResult(index=index, uv=0, pv=0, screenshot_path=_clear_stale_screenshot(index, screenshot_path), status="SCRAPE_ERROR", error=err)
     except Exception as e:
         err = str(e)[:80]
         print(f"[{n}/{total}] SCRAPE_ERROR: {err}")
         await _save_debug_artifacts(page, index, err)
-        return ScrapeResult(index=index, uv=0, pv=0, screenshot_path=screenshot_path, status="SCRAPE_ERROR", error=err)
+        return ScrapeResult(index=index, uv=0, pv=0, screenshot_path=_clear_stale_screenshot(index, screenshot_path), status="SCRAPE_ERROR", error=err)
 
 
 async def scrape_all_uv(data_date: Optional[datetime] = None) -> ScrapeReport:
