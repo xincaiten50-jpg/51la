@@ -461,9 +461,9 @@ async def run_once(cfg: Config, args: argparse.Namespace) -> list:
         report = await scraper.scrape_all_uv(data_date=ctx.report_date)
 
     # Step 2: Display results
+    scrape_errors = []
     if report is not None:
         print("\nSCRAPING RESULTS:")
-        scrape_errors = []
         for i, uv in enumerate(report.uv_results):
             pv = report.pv_results[i]
             col = scraper.COLUMNS[i]
@@ -484,13 +484,7 @@ async def run_once(cfg: Config, args: argparse.Namespace) -> list:
         if scrape_errors:
             print(f"\n⚠ PARTIAL FAILURE: {len(scrape_errors)} page(s) had SCRAPE_ERROR.")
             print("  Affected pages:", [f"#{i+1} ({cfg.machine_names[i]})" for i in scrape_errors])
-            if len(scrape_errors) == len(report.uv_results):
-                # All pages failed — raise so the scheduler retries instead of
-                # emailing an all-zero report (SCRAPE_ERROR never overwrites Excel)
-                raise RuntimeError(
-                    f"All {len(report.uv_results)} pages returned SCRAPE_ERROR — "
-                    "aborting before Excel write / notification"
-                )
+            print("  Excel is still written below (failed cells preserved); notification is skipped.")
     else:
         print("\n[SKIP] No scrape report available (--skip-scrape mode)")
 
@@ -518,6 +512,17 @@ async def run_once(cfg: Config, args: argparse.Namespace) -> list:
         print("\n[Step 2] SKIPPED (no scrape report available)")
         excel_write_ok = True
         excel_msg = "(no write)"
+
+    # Any SCRAPE_ERROR → abort before notification so the scheduler retries,
+    # instead of emailing a report with zeros for the failed pages. Excel has
+    # already been saved above (SCRAPE_ERROR cells preserve prior values), so
+    # data scraped in this attempt is not lost.
+    if scrape_errors:
+        failed_pages = ", ".join(f"#{i+1} ({cfg.machine_names[i]})" for i in scrape_errors)
+        raise RuntimeError(
+            f"{len(scrape_errors)}/{len(report.uv_results)} pages returned SCRAPE_ERROR "
+            f"({failed_pages}) — Excel saved; aborting before notification for retry"
+        )
 
     # Step 4: Excel screenshot
     excel_screenshot_path = ""
