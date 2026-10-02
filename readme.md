@@ -147,7 +147,9 @@ Cài đặt Task Scheduler:
 ### 5.1 Pre-created Monthly (mặc định, KHUYÊN DÙNG)
 - File Excel: `reports/51la_YYYY-MM.xlsx`
 - Ngày báo cáo = ngày hôm qua (`yesterday` trong Asia/Ho_Chi_Minh)
-- Nếu thiếu file hoặc thiếu dòng ngày → **BLOCKED**, không tự tạo
+- Nếu **thiếu file tháng**, hệ thống tự tạo bằng rollover từ file tháng gần nhất
+  (xem 5.4), giữ nguyên layout/formula/style. Tắt bằng `AUTO_ROLLOVER_MONTHLY_WORKBOOK=false`.
+- Nếu **thiếu dòng ngày** trong file đã có → **BLOCKED** (không tự thêm dòng trong chế độ này).
 
 ### 5.2 Legacy Mode
 ```bash
@@ -163,6 +165,26 @@ py -3 main.py --method gmail --lang zh --auto-create-monthly --allow-real-email
 - Tự tạo monthly workbook từ template
 - Có thể làm hỏng layout Excel tùy chỉnh
 
+### 5.4 Auto-rollover Monthly (mặc định BẬT, an toàn)
+Khi thiếu `reports/51la_YYYY-MM.xlsx`, hệ thống tự tạo bằng cách **sao chép file
+tháng gần nhất** rồi:
+- Điền lại cột B đủ số ngày của tháng (28/29/30/31)
+- Xoá vùng dữ liệu F/G/H/I
+- Dựng lại formula C/E, formula tổng và merged cells theo đúng số ngày
+- Giữ nguyên style/layout
+
+Ngoài ra, **sau mỗi lần chạy thành công**, hệ thống tự tạo sẵn workbook cho
+**tháng sau** để đầu tháng không bị BLOCKED.
+
+Tạo thủ công trước (không cần chờ scheduler):
+```bash
+python3 make_month.py            # tạo sẵn tháng sau
+python3 make_month.py 2026-11    # tạo tháng 11/2026
+python3 make_month.py --list     # liệt kê các file tháng hiện có
+```
+
+Tắt tự động: đặt `AUTO_ROLLOVER_MONTHLY_WORKBOOK=false` trong `.env`.
+
 ---
 
 ## 6. Xử lý sự cố
@@ -171,7 +193,9 @@ py -3 main.py --method gmail --lang zh --auto-create-monthly --allow-real-email
 → PM2 đang chạy từ thư mục CŨ. Di chuyển đến `D:\Download\manager\updated-mail-send\merged_51la` và chạy lại.
 
 ### Lỗi "Monthly workbook not found"
-→ Tạo file `reports/51la_YYYY-MM.xlsx` theo template mẫu
+→ Bình thường hệ thống tự tạo bằng rollover từ tháng gần nhất. Nếu vẫn lỗi
+(không có tháng nào trước đó), tạo thủ công: `python3 make_month.py 2026-11`
+hoặc copy `reports/51la_YYYY-MM.xlsx` theo template mẫu.
 
 ### Lỗi "Date row not found"
 → Thêm dòng ngày vào đúng vị trí trong file Excel (column B)

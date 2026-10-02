@@ -56,6 +56,7 @@ class Config:
     # Monthly workbook (pre-created)
     use_precreated_monthly_files: bool = False
     auto_create_monthly_workbook: bool = False  # opt-in only
+    auto_rollover_monthly_workbook: bool = True  # auto-create missing month by copying last month's layout
     reports_dir: str = "reports"
     report_file_pattern: str = "51la_{YYYY-MM}.xlsx"
     current_workbook_path: str = "51la_current.xlsx"
@@ -113,6 +114,7 @@ def load() -> Config:
         wecom_send_delay_seconds=float(_env("WECOM_SEND_DELAY_SECONDS", "1.0").strip()),
         use_precreated_monthly_files=_env("USE_PRECREATED_MONTHLY_FILES", "false").strip().lower() in {"1", "true", "yes", "on"},
         auto_create_monthly_workbook=_env("AUTO_CREATE_MONTHLY_WORKBOOK", "false").strip().lower() in {"1", "true", "yes", "on"},
+        auto_rollover_monthly_workbook=_env("AUTO_ROLLOVER_MONTHLY_WORKBOOK", "true").strip().lower() in {"1", "true", "yes", "on"},
         reports_dir=_env("REPORTS_DIR", "reports").strip(),
         report_file_pattern=_env("REPORT_FILE_PATTERN", "51la_{YYYY-MM}.xlsx").strip(),
         current_workbook_path=_env("CURRENT_WORKBOOK_PATH", "51la_current.xlsx").strip(),
