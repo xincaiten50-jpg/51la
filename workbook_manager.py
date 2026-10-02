@@ -11,11 +11,12 @@ Handles:
 """
 
 import os
+import re
 import shutil
 from copy import copy
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import openpyxl
 
@@ -133,6 +134,158 @@ def resolve_precreated_monthly_workbook(
         )
 
     return path
+
+
+# ==================== MONTHLY ROLLOVER (auto-create) ====================
+
+_MONTH_KEY_RE = re.compile(r"(\d{4})-(\d{2})")
+
+
+def list_monthly_workbooks(reports_dir: str, pattern: str = "51la_{YYYY-MM}.xlsx") -> List[Tuple[str, Path]]:
+    """Return [(month_key, path)] for the monthly workbooks present in reports_dir."""
+    reports_path = Path(reports_dir)
+    if not reports_path.is_dir():
+        return []
+    items: List[Tuple[str, Path]] = []
+    for p in sorted(reports_path.glob(pattern.replace("{YYYY-MM}", "*"))):
+        m = _MONTH_KEY_RE.search(p.name)
+        if m:
+            items.append((f"{m.group(1)}-{m.group(2)}", p))
+    return items
+
+
+def find_latest_monthly_workbook(
+    reports_dir: str,
+    target_month_key: str,
+    pattern: str = "51la_{YYYY-MM}.xlsx",
+) -> Optional[Path]:
+    """Return the newest monthly workbook strictly before target_month_key, or None."""
+    candidates = [(k, p) for k, p in list_monthly_workbooks(reports_dir, pattern) if k < target_month_key]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return candidates[-1][1]
+
+
+def create_month_workbook_rollover(source_path: Path, target_path: Path, report_date: date) -> Path:
+    """
+    Create a monthly workbook for report_date's month by rolling over an existing
+    monthly workbook (source_path), preserving its layout, styles and formulas.
+
+    - (Re)builds column B with every day of the target month.
+    - Clears the metric columns F/G/H/I.
+    - Rebuilds C/E per-row formulas and the summary/group formulas for the
+      correct number of days (28/29/30/31).
+    - Rebuilds the known merged ranges.
+
+    Never overwrites an existing target.
+    """
+    if target_path.exists():
+        return target_path
+
+    shutil.copy2(source_path, target_path)
+    wb = openpyxl.load_workbook(target_path)
+    ws = wb.active
+
+    # Unmerge everything; the known merges are rebuilt below for the new month.
+    for merged_range in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(merged_range))
+
+    year, month = report_date.year, report_date.month
+    days = _get_days_in_month(year, month)
+    first_row = 4
+    last_row = first_row + days - 1
+
+    # Count contiguous date rows starting at row 4 in the source layout.
+    current_last = first_row - 1
+    r = first_row
+    while normalize_excel_date(ws[f"{DATE_COLUMN}{r}"].value) is not None:
+        current_last = r
+        r += 1
+
+    # Grow rows to fit the target month (copy style from the row above).
+    while current_last < last_row:
+        insert_at = current_last + 1
+        ws.insert_rows(insert_at, 1)
+        for col in range(1, ws.max_column + 1):
+            src = ws.cell(row=current_last, column=col)
+            dst = ws.cell(row=insert_at, column=col)
+            if src.has_style:
+                dst.font = copy(src.font)
+                dst.fill = copy(src.fill)
+                dst.border = copy(src.border)
+                dst.alignment = copy(src.alignment)
+                dst.number_format = src.number_format
+        current_last = insert_at
+
+    # Shrink if the source month had more days.
+    if current_last > last_row:
+        ws.delete_rows(last_row + 1, current_last - last_row)
+
+    # Fill every day row and clear metric data.
+    for day in range(1, days + 1):
+        row = first_row + day - 1
+        ws[f"{DATE_COLUMN}{row}"] = datetime(year, month, day)
+        ws[f"C{row}"] = f"=SUM(F{row}:I{row})"
+        ws[f"D{row}"] = 0.002
+        ws[f"E{row}"] = f"=C{row}*D{row}"
+        for col in COLUMNS:
+            ws[f"{col}{row}"] = None
+
+    # Summary row (row 3) — cover all day rows.
+    ws["C3"] = f"=SUM(C{first_row}:C{last_row})"
+    ws["E3"] = f"=SUM(E{first_row}:E{last_row})"
+    for col in COLUMNS:
+        ws[f"{col}3"] = f"=SUM({col}{first_row}:{col}{last_row})"
+
+    # Column A group subtotals (12 / 10 / rest) — cover all day rows.
+    group_1_end = min(15, last_row)
+    group_2_end = min(25, last_row)
+    ws["A4"] = f"=SUM(E4:E{group_1_end})"
+    ws["A16"] = f"=SUM(E16:E{group_2_end})"
+    ws["A26"] = f"=SUM(E26:E{last_row})"
+
+    # Rebuild the known merged ranges.
+    ws.merge_cells("A1:B1")
+    ws.merge_cells("C1:F1")
+    ws.merge_cells("A2:A3")
+    ws.merge_cells("B2:B3")
+    ws.merge_cells(f"A4:A{group_1_end}")
+    ws.merge_cells(f"A16:A{group_2_end}")
+    ws.merge_cells(f"A26:A{last_row}")
+
+    wb.save(target_path)
+    wb.close()
+    print(f"[INFO] Monthly workbook created by rollover: {target_path} ({days} days)")
+    return target_path
+
+
+def ensure_month_workbook(
+    report_date: date,
+    reports_dir: str,
+    pattern: str = "51la_{YYYY-MM}.xlsx",
+) -> Path:
+    """
+    Return the monthly workbook for report_date's month, auto-creating it by
+    rollover from the latest previous month when it does not exist.
+
+    Raises MonthlyWorkbookMissingError only when there is no previous month to
+    roll over from.
+    """
+    month_key = get_month_key(report_date)
+    target = Path(reports_dir) / pattern.replace("{YYYY-MM}", month_key)
+    if target.exists():
+        return target
+
+    source = find_latest_monthly_workbook(reports_dir, month_key, pattern)
+    if source is None:
+        raise MonthlyWorkbookMissingError(
+            f"Monthly workbook not found: {target} and no earlier monthly workbook "
+            f"is available to roll over from. Please create this file manually."
+        )
+
+    print(f"[INFO] Monthly workbook missing for {month_key}; auto-creating from {source.name}...")
+    return create_month_workbook_rollover(source, target, report_date)
 
 
 def find_date_row_in_workbook(workbook_path: Path, report_date: date, sheet_name: str = "Sheet1") -> int:
@@ -291,7 +444,10 @@ def resolve_workbook_for_report(
     if use_precreated or env_precreated:
         reports_dir = getattr(cfg, "reports_dir", "reports")
         pattern = getattr(cfg, "report_file_pattern", "51la_{YYYY-MM}.xlsx")
-        path = resolve_precreated_monthly_workbook(report_date, reports_dir, pattern)
+        if getattr(cfg, "auto_rollover_monthly_workbook", True):
+            path = ensure_month_workbook(report_date, reports_dir, pattern)
+        else:
+            path = resolve_precreated_monthly_workbook(report_date, reports_dir, pattern)
         return path, "precreated", False
 
     # Auto-create monthly mode (only behind explicit opt-in)

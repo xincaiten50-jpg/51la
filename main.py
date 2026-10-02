@@ -97,7 +97,9 @@ def _resolve_run_context(cfg, args) -> RunContext:
         print("=" * 60)
         print("BLOCKED:", e)
         print("=" * 60)
-        sys.exit(1)
+        # Raise a normal exception so the scheduler records the failed attempt
+        # and retries/alerts instead of exiting (which caused a PM2 restart loop).
+        raise RuntimeError(f"BLOCKED: {e}")
 
     # Mismatch guard: workbook month must match report_date month
     if mode in {"precreated", "auto_create"}:
@@ -619,6 +621,29 @@ def print_summary(results: list, elapsed: float, dry_run: bool = False, no_notif
     print("=" * 60)
 
 
+def _precreate_next_month_workbook(cfg: Config):
+    """
+    Best-effort: ensure next month's monthly workbook exists, so the first run
+    of the new month cannot be BLOCKED by a missing file. Creates it by rolling
+    over the current month's layout.
+    """
+    try:
+        if not (cfg.use_precreated_monthly_files and cfg.auto_rollover_monthly_workbook):
+            return
+        tz = ZoneInfo(cfg.timezone)
+        today = datetime.now(tz).date()
+        if today.month == 12:
+            first_of_next = date(today.year + 1, 1, 1)
+        else:
+            first_of_next = date(today.year, today.month + 1, 1)
+        path = workbook_manager.ensure_month_workbook(
+            first_of_next, cfg.reports_dir, cfg.report_file_pattern
+        )
+        print(f"[INFO] Next month's workbook ready: {path}")
+    except Exception as e:
+        print(f"[WARN] Could not pre-create next month's workbook: {e}")
+
+
 def run_scheduled(cfg: Config, args: argparse.Namespace):
     """Daily scheduler at SCHEDULE_HOUR:SCHEDULE_MINUTE with catch-up + retry + alert.
 
@@ -712,6 +737,7 @@ def run_scheduled(cfg: Config, args: argparse.Namespace):
                 if failure_reason is None:
                     _write_run_state({"last_success": today_str, "attempts": 0, "attempt_date": today_str})
                     print(f"[{datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')}] Run succeeded — next run tomorrow at {cfg.schedule_hour:02d}:{cfg.schedule_minute:02d}.")
+                    _precreate_next_month_workbook(cfg)
                 else:
                     attempts += 1
                     _write_run_state({"last_success": state.get("last_success"), "attempts": attempts, "attempt_date": today_str})
@@ -890,6 +916,9 @@ def main():
                 print("=" * 60)
                 print("BLOCKED:", e)
                 print("=" * 60)
+                sys.exit(1)
+            except RuntimeError as e:
+                print(f"\n[ERROR] {e}")
                 sys.exit(1)
             elapsed = time_module.time() - start
 
