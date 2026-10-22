@@ -5,12 +5,11 @@ screenshots/
 *.png
 .running
 .run_state
-*.log.DS_Store
+.DS_Store
+*.log
 *.xlsx
 !templates/*.xlsx
-!.env
 reports/*.xlsx
 reports/
 51la.xlsx
 51la_current.xlsx
-reports/
