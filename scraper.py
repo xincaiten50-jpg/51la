@@ -210,7 +210,7 @@ async def _save_debug_artifacts(page: Page, index: int, error_msg: str):
     # Screenshot
     ss_path = os.path.join(debug_dir, f"failed_{n}.png")
     try:
-        await page.screenshot(path=ss_path, full_page=False)
+        await page.screenshot(path=ss_path, full_page=False, timeout=15000)
         print(f"[{n}] Debug screenshot: {ss_path}")
     except Exception as e:
         print(f"[{n}] Debug screenshot failed: {e}")
@@ -248,18 +248,55 @@ async def scrape_uv_from_link(
     total = len(LINKS)
 
     try:
-        print(f"[{n}/{total}] Opening: {link[:40]}...")
-        await page.goto(link, timeout=PAGE_TIMEOUT)
-        await asyncio.sleep(2)
+        # The 51.la page is a client-side (SPA) redirect that sometimes renders a
+        # blank page (slow/blocked third-party resources sdk.51.la / js.users.51.la,
+        # or a bad TLS cert). Reload it a few times before giving up.
+        MAX_LOAD_ATTEMPTS = 3       # initial load + reloads
+        RENDER_WAIT_STEPS = 15      # x 2s = up to 30s per attempt
+
+        password_input = None
+        rendered = False
+        for load_attempt in range(1, MAX_LOAD_ATTEMPTS + 1):
+            print(f"[{n}/{total}] Opening (attempt {load_attempt}/{MAX_LOAD_ATTEMPTS}): {link[:40]}...")
+            try:
+                await page.goto(link, timeout=PAGE_TIMEOUT, wait_until="commit")
+            except PlaywrightTimeout:
+                print(f"[{n}/{total}] Navigation commit timed out")
+            except Exception as e:
+                print(f"[{n}/{total}] Navigation error: {str(e)[:80]}")
+
+            # Wait for the SPA to render the password gate or the report (~30s)
+            password_input = None
+            for _ in range(RENDER_WAIT_STEPS):
+                password_input = await page.query_selector('input[type="password"]')
+                if password_input:
+                    rendered = True
+                    break
+                if await page.query_selector(UV_SELECTOR):
+                    rendered = True
+                    break
+                await asyncio.sleep(2)
+
+            if rendered:
+                break
+            if load_attempt < MAX_LOAD_ATTEMPTS:
+                print(f"[{n}/{total}] Page blank (no password gate / data) — reloading...")
+
+        if not rendered:
+            print(f"[{n}/{total}] Page still blank after {MAX_LOAD_ATTEMPTS} attempts")
 
         # Password gate
-        password_input = await page.query_selector('input[type="password"]')
         if password_input:
             print(f"[{n}/{total}] Entering password...")
             await password_input.fill(PASSWORD)
             await password_input.press("Enter")
-            await asyncio.sleep(5)
-        else:
+            # Wait for the report to render after login (~30s)
+            for _ in range(15):
+                if await page.query_selector(UV_SELECTOR):
+                    break
+                await asyncio.sleep(2)
+            await asyncio.sleep(1)
+        elif rendered:
             print(f"[{n}/{total}] No password required, waiting...")
             await asyncio.sleep(3)
 
@@ -318,6 +355,21 @@ async def scrape_uv_from_link(
         # uv > 0 = PASS, uv == 0 = NO_DATA
         uv_value = uv
 
+        # The report overview renders 0 first and fills in the real value after
+        # an async load. If we read 0, re-check after a short delay so a
+        # not-yet-loaded 0 is not mistaken for a genuine zero.
+        if uv_value == 0:
+            for _ in range(4):
+                await asyncio.sleep(3)
+                elem = await page.query_selector(UV_SELECTOR)
+                if not elem:
+                    continue
+                reval = _extract_numeric(await elem.inner_text())
+                if reval:
+                    print(f"[{n}/{total}] UV still loading — updated 0 → {reval:,}")
+                    uv_value = reval
+                    break
+
         # ---- PV extraction ----
         pv_value = 0
         pv_selectors = [
@@ -353,7 +405,7 @@ async def scrape_uv_from_link(
         # Screenshot
         print(f"[{n}/{total}] Taking screenshot...")
         try:
-            await page.screenshot(path=screenshot_path, full_page=False)
+            await page.screenshot(path=screenshot_path, full_page=False, timeout=15000)
             print(f"[{n}/{total}] Screenshot saved: {screenshot_path}")
         except Exception as e:
             print(f"[{n}/{total}] Screenshot error: {str(e)[:50]}...")
@@ -391,7 +443,10 @@ async def scrape_all_uv(data_date: Optional[datetime] = None) -> ScrapeReport:
 
         async def scrape_with_semaphore(link: str, index: int) -> ScrapeResult:
             async with semaphore:
-                context = await browser.new_context()
+                # 51.la has intermittently served a cert that fails validation
+                # (net::ERR_CERT_DATE_INVALID); ignore TLS errors so the scrape
+                # does not fail wholesale.
+                context = await browser.new_context(ignore_https_errors=True)
                 page = await context.new_page()
                 screenshot_path = os.path.join(SCREENSHOT_DIR, f"screenshot_{index + 1}.png")
                 try:
