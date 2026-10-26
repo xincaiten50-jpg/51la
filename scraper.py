@@ -230,6 +230,55 @@ async def _save_debug_artifacts(page: Page, index: int, error_msg: str):
 
 # ==================== MAIN SCRAPE FUNCTION ====================
 
+async def _resolve_zero_uv(page: Page, n: int, total: int, current: int) -> int:
+    """
+    A UV of 0 is ambiguous: the overview renders 0 until its async data APIs
+    return, which can lag far longer than a few seconds. Poll longer; if it is
+    still 0, reload the page (the login session persists) and poll again before
+    accepting a genuine zero. Returns the final UV value.
+    """
+    for reload_round in range(2):
+        steps = 6 if reload_round == 0 else 10  # 18s, then up to 30s
+        for _ in range(steps):
+            await asyncio.sleep(3)
+            try:
+                elem = await page.query_selector(UV_SELECTOR)
+            except Exception:
+                elem = None
+            if not elem:
+                continue
+            reval = _extract_numeric(await elem.inner_text())
+            if reval:
+                print(f"[{n}/{total}] UV still loading — updated 0 → {reval:,}")
+                return reval
+        if reload_round == 0:
+            print(f"[{n}/{total}] UV still 0 — reloading to force data load...")
+            try:
+                await page.reload(timeout=PAGE_TIMEOUT, wait_until="commit")
+            except Exception:
+                try:
+                    await page.goto(page.url, timeout=PAGE_TIMEOUT, wait_until="commit")
+                except Exception:
+                    pass
+            # Re-authenticate only if the password gate reappears
+            for _ in range(10):
+                try:
+                    pw = await page.query_selector('input[type="password"]')
+                except Exception:
+                    pw = None
+                if pw:
+                    try:
+                        await pw.fill(PASSWORD)
+                        await pw.press("Enter")
+                    except Exception:
+                        pass
+                    break
+                if await page.query_selector(UV_SELECTOR):
+                    break
+                await asyncio.sleep(2)
+    return current
+
+
 async def scrape_uv_from_link(
     page: Page,
     link: str,
@@ -358,17 +407,9 @@ async def scrape_uv_from_link(
         # The report overview renders 0 first and fills in the real value after
         # an async load. If we read 0, re-check after a short delay so a
         # not-yet-loaded 0 is not mistaken for a genuine zero.
+        # A 0 may mean "data not loaded yet" rather than a genuine zero.
         if uv_value == 0:
-            for _ in range(4):
-                await asyncio.sleep(3)
-                elem = await page.query_selector(UV_SELECTOR)
-                if not elem:
-                    continue
-                reval = _extract_numeric(await elem.inner_text())
-                if reval:
-                    print(f"[{n}/{total}] UV still loading — updated 0 → {reval:,}")
-                    uv_value = reval
-                    break
+            uv_value = await _resolve_zero_uv(page, n, total, uv_value)
 
         # ---- PV extraction ----
         pv_value = 0
