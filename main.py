@@ -14,6 +14,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import errno
 import json
 import os
 import sys
@@ -39,6 +40,7 @@ SCREENSHOT_DIR = "screenshots"
 # Scheduled-run resilience: catch-up + retry + alert
 MAX_RUN_ATTEMPTS = 5          # attempts per day before giving up and alerting
 RETRY_DELAY_SECONDS = 15 * 60  # wait between failed attempts
+MAX_EPERM_RESTARTS = 3        # re-execs allowed when macOS revokes folder access
 
 
 # ==================== RUN CONTEXT ====================
@@ -690,6 +692,9 @@ def run_scheduled(cfg: Config, args: argparse.Namespace):
         print(f"[INFO] Initialized {RUN_STATE_FILE} with today ({today_str}) — no catch-up on first start.")
 
     next_attempt_at = 0.0  # epoch seconds; 0 = no retry backoff pending
+    # EPERM re-exec counter — kept in the environment because os.execv replaces
+    # the process, so a plain local counter would reset and loop forever.
+    eperm_restarts = int(os.environ.get("51LA_EPERM_RESTARTS", "0") or "0")
 
     while True:
         try:
@@ -771,6 +776,24 @@ def run_scheduled(cfg: Config, args: argparse.Namespace):
         except KeyboardInterrupt:
             print("\n\n[INFO] Scheduler stopped by user.")
             break
+        except PermissionError as e:
+            # macOS TCC (App Management) can revoke read access to the project
+            # folder for launchd-spawned processes — surfaces as EPERM (errno 1),
+            # not EACCES. Re-exec restores the access grant.
+            if getattr(e, "errno", None) == errno.EPERM:
+                eperm_restarts += 1
+                if eperm_restarts > MAX_EPERM_RESTARTS:
+                    print(f"\n[ERROR] EPERM persists after {eperm_restarts - 1} re-execs — "
+                          f"giving up; check file permissions on {script_dir}")
+                    time_module.sleep(300)
+                    continue
+                print(f"\n[ERROR] EPERM reading config — re-executing to restore access "
+                      f"(restart {eperm_restarts}/{MAX_EPERM_RESTARTS}): {e}")
+                sys.stdout.flush()
+                os.environ["51LA_EPERM_RESTARTS"] = str(eperm_restarts)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            print(f"\n[ERROR] Scheduler error: {e}")
+            time_module.sleep(60)
         except Exception as e:
             print(f"\n[ERROR] Scheduler error: {e}")
             time_module.sleep(60)
